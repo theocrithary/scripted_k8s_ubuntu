@@ -29,13 +29,15 @@ set -e
 # You can change this to v1.31.0-00 once that version is released.
 KUBE_VERSION="1.30.14-1.1"
 
+HOST_NAME="dap.lab.local"
+
 # The CIDR for the pod network. This is required for Calico.
 #POD_NETWORK_CIDR="161.200.0.0/16"
 
 # The IP address range for MetalLB to use for LoadBalancer services.
 # This range MUST be configured to a free range on your local network that
 # is NOT managed by your router's DHCP server.
-METALLB_IP_RANGE="192.168.0.90-192.168.0.95"
+METALLB_IP="192.168.0.25"
 
 # ================================
 # 2. Pre-requisites and Host Prep
@@ -52,7 +54,7 @@ fi
 echo "--> Disabling swap..."
 swapoff -a
 # Permanently disable swap in fstab by commenting out the swap line.
-sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+sed -i '/swap/s/^/#/' /etc/fstab
 
 # Load kernel modules and configure sysctl for Kubernetes networking
 echo "--> Configuring kernel modules for Kubernetes..."
@@ -136,11 +138,11 @@ rm get_helm.sh
 # ============================================
 echo "--> Initializing the Kubernetes control plane..."
 
-cat <<EOF | kubeadm init --upload-certs 
+cat <<EOF > k8-singlenode.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-controlPlaneEndpoint: "k8s.lab.local:6443"
-kubernetesVersion: v1.30.4
+controlPlaneEndpoint: "$HOST_NAME:6443"
+kubernetesVersion: $KUBE_VERSION
 networking:
     podSubnet: 161.200.0.0/16
     serviceSubnet: 161.210.0.0/16
@@ -151,7 +153,7 @@ serverTLSBootstrap: true
 maxPods: 150
 EOF
 
-#kubeadm init --pod-network-cidr="$POD_NETWORK_CIDR"
+kubeadm init --upload-certs --config=k8s-singlenode.yaml
 
 # ============================================
 # 7. Configure Kubectl for the Current User
@@ -173,7 +175,7 @@ kubectl taint nodes "$NODE_NAME" node-role.kubernetes.io/control-plane:NoSchedul
 # 9. Install a Pod Network Add-on (Calico)
 # ============================================
 echo "--> Deploying Calico Pod Network Add-on..."
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.5/manifests/calico.yaml
 
 # ============================================
 # 10. Install MetalLB
@@ -199,7 +201,7 @@ metadata:
   namespace: metallb-system
 spec: 
   addresses: 
-  - 192.168.0.45/32
+  - $METALLB_IP/32
 EOF
 
 # ============================================
