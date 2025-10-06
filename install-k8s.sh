@@ -18,9 +18,21 @@
 #
 # IMPORTANT: This script requires root privileges.
 # Run with: sudo ./install-k8s.sh
+
+# sudo ./install_k8s.sh -u <your_username> -p <your_password>
 # ==============================================================================
 
+#while getopts ":u:p:" opt; do
+#  case $opt in
+#    u) DOCKER_USERNAME="$OPTARG";;
+#    p) DOCKER_PASSWORD="$OPTARG";;
+#    \?) echo "Invalid option: -$OPTARG"; exit 1;;
+#  esac
+#done
+
 set -e
+
+
 
 # ================================
 # 1. Define Cluster Variables
@@ -29,15 +41,13 @@ set -e
 # You can change this to v1.31.0-00 once that version is released.
 KUBE_VERSION="1.30.14-1.1"
 
-HOST_NAME="dap.lab.local"
-
 # The CIDR for the pod network. This is required for Calico.
 #POD_NETWORK_CIDR="161.200.0.0/16"
 
 # The IP address range for MetalLB to use for LoadBalancer services.
 # This range MUST be configured to a free range on your local network that
 # is NOT managed by your router's DHCP server.
-METALLB_IP="192.168.0.25"
+METALLB_IP_RANGE="192.168.0.90-192.168.0.95"
 
 # ================================
 # 2. Pre-requisites and Host Prep
@@ -54,7 +64,7 @@ fi
 echo "--> Disabling swap..."
 swapoff -a
 # Permanently disable swap in fstab by commenting out the swap line.
-sed -i '/swap/s/^/#/' /etc/fstab
+sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
 # Load kernel modules and configure sysctl for Kubernetes networking
 echo "--> Configuring kernel modules for Kubernetes..."
@@ -138,11 +148,11 @@ rm get_helm.sh
 # ============================================
 echo "--> Initializing the Kubernetes control plane..."
 
-cat <<EOF > k8-singlenode.yaml
+cat <<EOF | kubeadm init --upload-certs 
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-controlPlaneEndpoint: "$HOST_NAME:6443"
-kubernetesVersion: $KUBE_VERSION
+controlPlaneEndpoint: "k8s.lab.local:6443"
+kubernetesVersion: v1.30.4
 networking:
     podSubnet: 161.200.0.0/16
     serviceSubnet: 161.210.0.0/16
@@ -153,7 +163,7 @@ serverTLSBootstrap: true
 maxPods: 150
 EOF
 
-kubeadm init --upload-certs --config=k8s-singlenode.yaml
+#kubeadm init --pod-network-cidr="$POD_NETWORK_CIDR"
 
 # ============================================
 # 7. Configure Kubectl for the Current User
@@ -193,7 +203,7 @@ helm install metallb metallb/metallb --namespace metallb-system --create-namespa
 
 # Create a manifest to configure MetalLB with an IP address pool
 
-cat << EOF > metallb.yaml
+cat <<EOF > metallb.yaml
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata: 
@@ -201,24 +211,61 @@ metadata:
   namespace: metallb-system
 spec: 
   addresses: 
-  - $METALLB_IP/32
+  - 192.168.0.45/32
 EOF
 
 # ============================================
-# 11. Install Docker client tools
+# 11. Install Docker client tools - V2
 # ============================================
 echo "--> Installing Docker client tools..."
 
-curl -fsSL https://get.docker.com -o get-docker.sh
-sh get-docker.sh
+# Install required dependencies
+apt-get update
+apt-get install -y ca-certificates curl gnupg lsb-release
 
-#Add the local user to the Docker group:
+# Add Docker’s official GPG key
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+# Add Docker repository to APT sources
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+  tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Update package index and install Docker
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io
+
+# Enable and start Docker service
+systemctl enable --now docker
+
+# Add current user to Docker group
 usermod -aG docker $USER
 
 # ============================================
 # 12. Setup MetalLB pool
 # ============================================
 
+echo "--> Waiting for Kubernetes control-plane to become Ready..."
+
+# Record the start time
+START_TIME=$(date +%s)
+
+# Loop until the control-plane node is Ready
+until kubectl get nodes | grep -E 'control-plane.*Ready'; do
+  CURRENT_TIME=$(date +%s)
+  ELAPSED=$((CURRENT_TIME - START_TIME))
+  MINUTES=$((ELAPSED / 60))
+  SECONDS=$((ELAPSED % 60))
+  echo "Still waiting... elapsed time: ${MINUTES}m ${SECONDS}s"
+  sleep 5
+done
+
+echo "--> Control-plane is Ready after ${MINUTES}m ${SECONDS}s. Proceeding with MetalLB configuration..."
+
+# Apply the MetalLB configuration
 kubectl apply -f metallb.yaml
 
 # ============================================
