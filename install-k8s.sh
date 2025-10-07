@@ -116,10 +116,10 @@ log_section_start() {
   local section_title="$1"
   local now_human=$(timestamp)
   local elapsed_since_prev=$(elapsed_since "$SECTION_START_TS")
+  echo ""
   echo " # =============================================== "
   echo "\n--> [${now_human}] Starting: ${section_title} (since previous: ${elapsed_since_prev})\n"
   echo " # =============================================== "
-  echo ""
    # update SECTION_START_TS to now for the next section
   SECTION_START_TS=$(date +%s)
 }
@@ -666,7 +666,7 @@ log_section_start "Installation Complete"
 kubectl get pods -n kube-system
 
 echo " # =============================================== "
-echo " "
+echo ""
 
 # Print total script runtime
 if [ -n "${SCRIPT_START_TS:-}" ]; then
@@ -677,9 +677,7 @@ if [ -n "${SCRIPT_START_TS:-}" ]; then
   secs=$((total_sec % 60))
   printf "\nTotal script runtime: %02dh:%02dm:%02ds\n" "$hrs" "$mins" "$secs"
 fi
-
-echo " "
-echo " "
+echo ""
 
 # Export kubeconfig to current directory and print to screen
 KUBECONF_SRC="/etc/kubernetes/admin.conf"
@@ -693,13 +691,14 @@ if [ -f "$KUBECONF_SRC" ]; then
   chmod 600 "$KUBECONF_OUT" || true
   chmod 600 "$KUBECONF_CFG" || true
   echo "\n---- kubeconfig (begin) ----"
+  echo ""
   sed -n '1,200p' "$KUBECONF_SRC"
+  echo ""
   echo "---- kubeconfig (end) ----\n"
-  echo " "
+  echo ""
 
 else
   echo "Warning: $KUBECONF_SRC not found; cannot export kubeconfig."
 fi
-echo " "
 
 
