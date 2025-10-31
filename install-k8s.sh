@@ -49,12 +49,9 @@ set -e
 
 # The version of Kubernetes to install.
 KUBE_VERSION="1.30.14-1.1"
-API_HOST="k8s.lab.local"
+API_HOST="dap.lab.local"
 
-# The IP address for MetalLB to use for LoadBalancer service.
-# This IP MUST be configured to a free IP on your local network that
-# is NOT managed by your router's DHCP server.
-# for a single node k8s, you can use the host's IP with /32 mask
+# Load balancer pool, for a single node k8s, you can use the host's IP with /32 mask
 METALLB_IP="192.168.0.25/32"
 
 # ================================
@@ -185,7 +182,8 @@ fi
 echo "--> Disabling swap..."
 swapoff -a
 # Permanently disable swap in fstab by commenting out the swap line.
-sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+#sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+sed -i '/\/swap.img/s/^/#/' /etc/fstab
 
 # Load kernel modules and configure sysctl for Kubernetes networking
 echo "--> Configuring kernel modules for Kubernetes..."
@@ -262,11 +260,104 @@ systemctl enable --now kubelet
 log_section_start "5. Install Helm CLI"
 echo "--> Install Helm CLI"
 
-# Download and install the Helm CLI
-curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-chmod 700 get_helm.sh
-./get_helm.sh
-rm get_helm.sh
+install_helm_with_retries() {
+  local tries=3
+  local wait_sec=5
+  local attempt=1
+  local workdir
+
+  apt-get update
+  apt-get install -y ca-certificates curl tar gzip
+
+  # Determine OS and ARCH for helm release asset
+  local os="linux"
+  local raw_arch
+  raw_arch=$(uname -m)
+  local arch
+  case "$raw_arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    armv7l|armhf) arch="arm" ;;
+    ppc64le) arch="ppc64le" ;;
+    s390x) arch="s390x" ;;
+    *) arch="amd64" ;;
+  esac
+
+  while [ $attempt -le $tries ]; do
+    echo "Attempt $attempt: fetch latest helm release tag..."
+    # fetch latest tag name from GitHub releases
+    tag=$(curl -fsSL "https://api.github.com/repos/helm/helm/releases/latest" | grep -m1 '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') || tag=""
+    if [ -z "$tag" ]; then
+      echo "Failed to determine latest helm tag (network or API rate limit)."
+      tag="v3.11.2"
+      echo "Falling back to $tag"
+    else
+      echo "Latest helm tag: $tag"
+    fi
+
+    tarball_url="https://get.helm.sh/helm-${tag}-${os}-${arch}.tar.gz"
+    echo "Downloading ${tarball_url}"
+
+    workdir=$(mktemp -d -t helm-install-XXXX)
+    tmpfile="$workdir/helm-${tag}.tar.gz"
+
+    if curl -fsSLo "$tmpfile" "$tarball_url"; then
+      echo "Downloaded helm tarball to $tmpfile"
+      if tar -xzf "$tmpfile" -C "$workdir"; then
+        # extracted path is ${os}-${arch}/helm
+        binpath="$workdir/${os}-${arch}/helm"
+        if [ -f "$binpath" ]; then
+          echo "Installing helm binary to /usr/local/bin"
+          install -m 0755 "$binpath" /usr/local/bin/helm && {
+            rm -rf "$workdir"
+            echo "Helm installed successfully."
+            return 0
+          } || {
+            echo "Failed to move helm to /usr/local/bin (permission issue?)"
+          }
+        else
+          echo "Helm binary not found in archive"
+        fi
+      else
+        echo "Failed to extract helm tarball"
+      fi
+    else
+      echo "Download failed (network or 404): $tarball_url"
+    fi
+
+    # log for diagnosis
+    echo "Installer attempt $attempt failed; see /tmp/helm_install_${attempt}.log if present"
+    attempt=$((attempt + 1))
+    echo "Waiting ${wait_sec}s before retry..."
+    sleep $wait_sec
+    wait_sec=$((wait_sec * 2))
+    rm -rf "$workdir" || true
+  done
+
+  echo "ERROR: Helm installation failed after ${tries} attempts."
+  return 1
+}
+
+# call it
+install_helm_with_retries || exit 1
+
+# Verify helm is available; if not, dump installer logs and fail early
+if ! command -v helm >/dev/null 2>&1; then
+  echo "ERROR: 'helm' binary not found after installation attempts. Dumping installer logs for diagnosis..."
+  for f in /tmp/helm_install_*.log; do
+    if [ -f "$f" ]; then
+      echo "---- $f ----"
+      sed -n '1,200p' "$f"
+    fi
+  done
+  echo "---- Diagnostics ----"
+  uname -a || true
+  echo "PATH=$PATH"
+  ls -l /usr/local/bin | head -n 50 || true
+  echo "---- End diagnostics ----"
+  echo "Exiting because helm is required for subsequent steps.";
+  exit 1
+fi
 
 # ============================================
 # 6. Initialize the Control Plane
@@ -547,7 +638,7 @@ spec:
   - $METALLB_IP
 EOF
 
-log_section_start "13. Setup MetalLB pool"
+log_section_start "12b. Setup MetalLB pool"
 echo "--> Waiting for all system pods in kube-system namespace to be Ready..."
 
 START_TIME=$(date +%s)
@@ -608,114 +699,7 @@ if [ -f "$KUBECONF_SRC" ]; then
   echo ""
   echo "---- kubeconfig (end) ----\n"
   echo ""
-  # If the user provided an external API host or DNS, update the server: fields
-  if [ -n "${API_HOST:-}" ]; then
-    # ensure host includes port
-    if echo "$API_HOST" | grep -q ':'; then
-      HOSTPORT="$API_HOST"
-    else
-      HOSTPORT="${API_HOST}:6443"
-    fi
-    # Update the server field in the exported kubeconfigs to use the provided host
-    sed -i -E "s@(server:[[:space:]]*https?://)[^\" ]+@\1${HOSTPORT}@g" "$KUBECONF_OUT" || true
-    sed -i -E "s@(server:[[:space:]]*https?://)[^\" ]+@\1${HOSTPORT}@g" "$KUBECONF_CFG" || true
-    echo "Updated exported kubeconfigs to use https://${HOSTPORT} as API server"
-  fi
+  
 else
   echo "Warning: $KUBECONF_SRC not found; cannot export kubeconfig."
-fi
-
-# ============================================
-# Post-installation: Print API endpoint and export certs
-# ============================================
-
-# Print external API endpoint information (from kubeconfig or fallback)
-API_ENDPOINT=""
-if [ -f "$KUBECONF_SRC" ]; then
-  # try to parse server URL from admin.conf. This extracts host:port from the server field.
-  API_ENDPOINT=$(sed -n '1,200p' "$KUBECONF_SRC" | grep 'server:' | head -n1 | sed -E 's/.*server:[[:space:]]*https?:\/\/(.*)/\1/' | tr -d '\"') || API_ENDPOINT=""
-fi
-
-if [ -z "$API_ENDPOINT" ]; then
-  # attempt to find primary non-loopback IPv4 for this host
-  HOST_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -n1 || true)
-  if [ -n "$HOST_IP" ]; then
-    API_ENDPOINT="${HOST_IP}:6443"
-  else
-    API_ENDPOINT="<node-ip>:6443"
-    API_ENDPOINT="<node-ip>:6443"
-  fi
-fi
-
-echo "\nCluster API endpoint (use this externally): ${API_ENDPOINT}"
-if [ -f "$KUBECONF_OUT" ]; then
-  echo " # =============================================== "
-  echo ""
-  echo "You can use the exported kubeconfig file to connect:"
-  echo "  KUBECONFIG=$(pwd)/kubeconfig kubectl get nodes --server=https://${API_ENDPOINT}"
-else
-  echo "If you have an admin kubeconfig, you can use kubectl like this (replace <kubeconfig>):"
-  echo "  KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --server=https://${API_ENDPOINT}"
-fi
-
-# Export CA and client certificates from the admin kubeconfig (PEM + DER)
-if [ -f "$KUBECONF_SRC" ]; then
-  # ensure EXEC_DIR is set
-  EXEC_DIR="${EXEC_DIR:-$(pwd)}"
-
-  base64_decode() {
-    if command -v base64 >/dev/null 2>&1; then
-      if base64 --help 2>&1 | grep -q -- --decode; then
-        base64 --decode
-      else
-        base64 -d
-      fi
-    elif command -v openssl >/dev/null 2>&1; then
-      openssl base64 -d -A
-    else
-      return 1
-    fi
-  }
-
-  ca_b64=$(grep 'certificate-authority-data:' "$KUBECONF_SRC" | head -n1 | awk '{print $2}' | tr -d '"' || true)
-  if [ -n "$ca_b64" ]; then
-    CA_PEM="$EXEC_DIR/ca.crt.pem"
-    CA_DER="$EXEC_DIR/ca.crt.der"
-    printf "%s" "$ca_b64" | base64_decode > "$CA_PEM" 2>/dev/null || true
-    if [ -s "$CA_PEM" ]; then
-      chmod 666 "$CA_PEM" || true
-      if command -v openssl >/dev/null 2>&1; then
-        openssl x509 -in "$CA_PEM" -outform DER -out "$CA_DER" 2>/dev/null || true
-        [ -f "$CA_DER" ] && chmod 666 "$CA_DER" || true
-        echo "Exported CA certificate: $CA_PEM (PEM) and $CA_DER (DER)"
-      else
-        echo "Exported CA certificate: $CA_PEM (PEM) - openssl not found, DER skipped"
-      fi
-    else
-      echo "[WARN] Failed to decode certificate-authority-data from $KUBECONF_SRC"
-    fi
-  else
-    echo "[INFO] No certificate-authority-data found in $KUBECONF_SRC"
-  fi
-
-  client_b64=$(grep 'client-certificate-data:' "$KUBECONF_SRC" | head -n1 | awk '{print $2}' | tr -d '"' || true)
-  if [ -n "$client_b64" ]; then
-    CLIENT_PEM="$EXEC_DIR/client.crt.pem"
-    CLIENT_DER="$EXEC_DIR/client.crt.der"
-    printf "%s" "$client_b64" | base64_decode > "$CLIENT_PEM" 2>/dev/null || true
-    if [ -s "$CLIENT_PEM" ]; then
-      chmod 666 "$CLIENT_PEM" || true
-      if command -v openssl >/dev/null 2>&1; then
-        openssl x509 -in "$CLIENT_PEM" -outform DER -out "$CLIENT_DER" 2>/dev/null || true
-        [ -f "$CLIENT_DER" ] && chmod 666 "$CLIENT_DER" || true
-        echo "Exported client certificate: $CLIENT_PEM (PEM) and $CLIENT_DER (DER)"
-      else
-        echo "Exported client certificate: $CLIENT_PEM (PEM) - openssl not found, DER skipped"
-      fi
-    else
-      echo "[WARN] Failed to decode client-certificate-data from $KUBECONF_SRC"
-    fi
-  else
-    echo "[INFO] No client-certificate-data found in $KUBECONF_SRC"
-  fi
 fi
